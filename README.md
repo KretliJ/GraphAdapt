@@ -81,6 +81,11 @@ GraphAdapt/
 - Does not infer types for external objects (self.engine.method() falls back to global lookup)
 - Static analysis only - no runtime information
 
+## Issues
+
+- Vizualization is a problem to be solved in itself
+- Tests are incomplete
+
 ## Requirements
 
 - Python 3.10+
