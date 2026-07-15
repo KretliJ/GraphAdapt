@@ -1,5 +1,4 @@
 import ast
-import time
 import networkx as nx
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
@@ -8,45 +7,161 @@ import os
 import sys
 import math
 import argparse
+import time
+import configparser
 from datetime import datetime
-import shutil
+from pathlib import Path
+from typing import Dict, List, Set, Optional, Tuple, Any
+from dataclasses import dataclass, field
 
-def ensure_results_dir(subfolder=None):
-    """Create and return path to results directory."""
-    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-    if subfolder:
-        base_dir = os.path.join(base_dir, subfolder)
-    os.makedirs(base_dir, exist_ok=True)
-    return base_dir
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-def generate_output_filename(base_name, suffix="multi_file_call_graph", results_dir=None):
-    """Generate a timestamped filename in the results folder."""
+CONFIG_FILE = "config.ini"
+DEFAULT_CONFIG = {
+    'paths': {
+        'results_dir': 'results',
+        'output_prefix': 'GraphAdapt',
+    },
+    'analysis': {
+        'selfie_suffix': 'selfie',
+        'default_suffix': 'multi_file_call_graph',
+    },
+    'logging': {
+        'debug': 'false',
+        'verbose': 'false',
+    },
+    'layout': {
+        'max_row_width': '80',
+        'max_local_width': '30',
+        'file_padding': '6.0',
+        'class_padding': '3.0',
+    }
+}
+
+class Config:
+    """Singleton configuration manager."""
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._load()
+        return cls._instance
+    
+    def _load(self):
+        self.config = configparser.ConfigParser()
+        
+        # Load defaults
+        for section, values in DEFAULT_CONFIG.items():
+            if not self.config.has_section(section):
+                self.config.add_section(section)
+            for key, val in values.items():
+                self.config.set(section, key, str(val))
+        
+        # Override with config.ini if it exists
+        if os.path.exists(CONFIG_FILE):
+            self.config.read(CONFIG_FILE)
+        
+        # Ensure config.ini exists with current values
+        self._save()
+    
+    def _save(self):
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            self.config.write(f)
+    
+    def get(self, section, key, fallback=None):
+        """Get a config value, converting types automatically."""
+        try:
+            val = self.config.get(section, key)
+            # Try to convert to appropriate type
+            if val.lower() in ('true', 'false'):
+                return val.lower() == 'true'
+            try:
+                return int(val)
+            except ValueError:
+                try:
+                    return float(val)
+                except ValueError:
+                    return val
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            return fallback
+    
+    def get_path(self, key, fallback=None):
+        """Get a path from the paths section."""
+        return self.get('paths', key, fallback)
+    
+    def get_analysis(self, key, fallback=None):
+        """Get an analysis setting."""
+        return self.get('analysis', key, fallback)
+    
+    def get_layout(self, key, fallback=None):
+        """Get a layout setting."""
+        return self.get('layout', key, fallback)
+    
+    def is_debug(self):
+        """Check if debug mode is enabled."""
+        return self.get('logging', 'debug', False)
+    
+    def is_verbose(self):
+        """Check if verbose mode is enabled."""
+        return self.get('logging', 'verbose', False)
+
+config = Config()
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def get_output_path(base_name: str, suffix: str = None, results_dir: str = None) -> str:
+    """
+    Build the full output path with timestamp.
+    
+    Args:
+        base_name: Base name for the file (e.g., "project")
+        suffix: Suffix to add (e.g., "selfie", "multi_file_call_graph")
+        results_dir: Directory name (default: from config)
+    
+    Returns:
+        Full path to the output file
+    """
     if results_dir is None:
-        results_dir = ensure_results_dir()
+        results_dir = config.get_path('results_dir', 'results')
+    
+    if suffix is None:
+        suffix = config.get_analysis('default_suffix', 'multi_file_call_graph')
+    
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), results_dir)
+    os.makedirs(base, exist_ok=True)
+    
+    prefix = config.get_path('output_prefix', 'GraphAdapt')
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{base_name}_{suffix}_{timestamp}.pdf"
-    return os.path.join(results_dir, filename)
+    filename = f"{prefix}_{base_name}_{suffix}_{timestamp}.pdf"
+    return os.path.join(base, filename)
 
-def cleanup_results(days=7, results_dir=None):
+def cleanup_results(days: int = 7, results_dir: str = None):
     """Delete result files older than N days."""
     if results_dir is None:
-        results_dir = ensure_results_dir()
+        results_dir = config.get_path('results_dir', 'results')
     
-    if not os.path.exists(results_dir):
-        print(f"📁 Results directory not found: {results_dir}")
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), results_dir)
+    if not os.path.exists(base):
+        print(f"📁 Results directory not found: {base}")
         return 0
     
     cutoff = time.time() - (days * 86400)
     count = 0
     
-    for filename in os.listdir(results_dir):
+    for filename in os.listdir(base):
         if filename.endswith(".pdf"):
-            filepath = os.path.join(results_dir, filename)
+            filepath = os.path.join(base, filename)
             try:
                 if os.path.getmtime(filepath) < cutoff:
                     os.remove(filepath)
                     count += 1
-                    print(f"  🗑️  Removed: {filename}")
+                    if config.is_verbose():
+                        print(f"  🗑️  Removed: {filename}")
             except (OSError, PermissionError) as e:
                 print(f"  ⚠️  Could not remove {filename}: {e}")
     
@@ -57,287 +172,500 @@ def cleanup_results(days=7, results_dir=None):
     
     return count
 
+def path_to_module(filepath: str, root_dir: str) -> str:
+    """Convert a file path to a Python module name."""
+    rel_path = os.path.relpath(filepath, root_dir)
+    module = rel_path[:-3] if rel_path.endswith('.py') else rel_path
+    module = module.replace(os.sep, '.')
+    return module
+
+def debug(msg: str):
+    """Print debug message if debug mode is enabled."""
+    if config.is_debug():
+        print(f"[DEBUG] {msg}")
+
+# ============================================================================
+# PASS 1: CATALOG DEFINITIONS
+# ============================================================================
+
 class Pass1Visitor(ast.NodeVisitor):
-    def __init__(self, analyzer, filename):
+    """First pass: catalog all class, function, and method definitions."""
+    
+    def __init__(self, analyzer: 'FolderGraphAnalyzer', filepath: str, module_name: str):
         self.analyzer = analyzer
-        self.filename = filename
-        self.current_class = None
-
-    def visit_ClassDef(self, node):
-        node_id = f"{self.filename}::{node.name}"
-        self.analyzer.defined_classes.add(node_id)
-        self.analyzer.class_to_file[node.name] = self.filename
-        self.analyzer.file_clusters[self.filename].append(node_id)
+        self.filepath = filepath
+        self.module_name = module_name
+        self.current_class: Optional[str] = None
+        self.current_function: Optional[str] = None
+    
+    def visit_ClassDef(self, node: ast.ClassDef):
+        """Catalog a class definition."""
+        node_id = f"{self.module_name}::{node.name}"
+        
+        self.analyzer.classes[node_id] = self.filepath
+        self.analyzer.class_by_name.setdefault(node.name, []).append(node_id)
         self.analyzer.graph.add_node(node_id, label=node.name, node_type='class')
-        print(f"[DEBUG-PASS-1] Cataloged Class: {node_id}")
-
-        # Keep track of context so child functions know they are methods
+        
+        debug(f"Cataloged Class: {node_id}")
+        
         prev_class = self.current_class
         self.current_class = node_id
         self.generic_visit(node)
         self.current_class = prev_class
-
-    def visit_FunctionDef(self, node):
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """Catalog a function or method definition."""
         if self.current_class:
-            # It's a method: scope the node id to its owning class so that
-            # same-named methods in different classes (e.g. visit_ClassDef
-            # in two visitor classes in the same file) don't collide into
-            # a single shared graph node.
-            class_name = self.current_class.split("::", 1)[1]
-            node_id = f"{self.filename}::{class_name}.{node.name}"
+            class_name = self.current_class.split("::")[1]
+            node_id = f"{self.module_name}::{class_name}.{node.name}"
+            
             self.analyzer.methods_by_class.setdefault(self.current_class, {})[node.name] = node_id
-            # Store the full node id here (not just the filename) since
-            # method node ids are class-scoped, unlike function_to_file.
-            self.analyzer.method_to_file[node.name] = node_id
+            self.analyzer.method_by_name.setdefault(node.name, []).append(node_id)
         else:
-            node_id = f"{self.filename}::{node.name}"
-            self.analyzer.defined_functions.add(node_id)
-            self.analyzer.function_to_file[node.name] = self.filename
-
-        self.analyzer.file_clusters[self.filename].append(node_id)
+            node_id = f"{self.module_name}::{node.name}"
+            self.analyzer.function_by_name.setdefault(node.name, []).append(node_id)
+        
+        self.analyzer.functions[node_id] = self.filepath
         self.analyzer.graph.add_node(node_id, label=node.name, node_type='function')
-        print(f"[DEBUG-PASS-1] Cataloged Function/Method: {node_id}")
-
+        
+        debug(f"Cataloged Function/Method: {node_id}")
+        
         if self.current_class:
-            # Solid line establishing ownership from Class to Method
             self.analyzer.graph.add_edge(self.current_class, node_id, edge_type='owns')
-
+        
+        prev_func = self.current_function
+        self.current_function = node_id
         self.generic_visit(node)
+        self.current_function = prev_func
 
-class FolderGraphAnalyzer(ast.NodeVisitor):
+# ============================================================================
+# PASS 2: COLLECT IMPORTS
+# ============================================================================
+
+@dataclass
+class ImportInfo:
+    """Information about an imported name."""
+    alias: str
+    module: str
+    original_name: Optional[str] = None
+    is_relative: bool = False
+
+class ImportCollector(ast.NodeVisitor):
+    """Second pass: collect all imports from a file."""
+    
+    def __init__(self, module_name: str):
+        self.module_name = module_name
+        self.imports: Dict[str, ImportInfo] = {}
+    
+    def visit_Import(self, node: ast.Import):
+        for alias in node.names:
+            name = alias.asname or alias.name
+            self.imports[name] = ImportInfo(
+                alias=name,
+                module=alias.name,
+                original_name=None,
+                is_relative=False
+            )
+    
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        module = node.module or ""
+        is_relative = node.level > 0
+        
+        if is_relative:
+            parts = self.module_name.split('.')
+            if node.level <= len(parts):
+                base_parts = parts[:-node.level]
+            else:
+                base_parts = []
+            
+            if module:
+                base_parts.append(module)
+            abs_module = '.'.join(base_parts)
+        else:
+            abs_module = module
+        
+        for alias in node.names:
+            name = alias.asname or alias.name
+            self.imports[name] = ImportInfo(
+                alias=name,
+                module=abs_module,
+                original_name=alias.name,
+                is_relative=is_relative
+            )
+    
+    @classmethod
+    def collect(cls, tree: ast.AST, module_name: str) -> Dict[str, ImportInfo]:
+        collector = cls(module_name)
+        collector.visit(tree)
+        return collector.imports
+
+# ============================================================================
+# PASS 3: RESOLVE CALLS
+# ============================================================================
+
+class CallResolver:
+    """Resolve function and class names to their full qualified IDs."""
+    
+    def __init__(self, analyzer: 'FolderGraphAnalyzer'):
+        self.analyzer = analyzer
+        self.current_module: Optional[str] = None
+        self.current_file: Optional[str] = None
+        self.current_function: Optional[str] = None
+        self.current_class: Optional[str] = None
+        self.imports: Dict[str, ImportInfo] = {}
+    
+    def resolve(self, name: str) -> Optional[str]:
+        """Resolve a name to a full qualified ID."""
+        if self.current_module is None:
+            return None
+        
+        # 1. Check imports
+        if name in self.imports:
+            imp = self.imports[name]
+            target_name = imp.original_name or imp.alias
+            target_id = f"{imp.module}::{target_name}"
+            
+            if target_id in self.analyzer.functions or target_id in self.analyzer.classes:
+                debug(f"Import resolved: {name} → {target_id}")
+                return target_id
+        
+        # 2. Check current module
+        local_id = f"{self.current_module}::{name}"
+        if local_id in self.analyzer.functions or local_id in self.analyzer.classes:
+            debug(f"Local resolved: {name} → {local_id}")
+            return local_id
+        
+        # 3. Check current class methods
+        if self.current_class:
+            class_id = self.current_class
+            if class_id in self.analyzer.methods_by_class:
+                methods = self.analyzer.methods_by_class[class_id]
+                if name in methods:
+                    debug(f"Method resolved: {name} → {methods[name]}")
+                    return methods[name]
+        
+        # 4. Check global definitions
+        candidates = []
+        candidates.extend(self.analyzer.function_by_name.get(name, []))
+        candidates.extend(self.analyzer.class_by_name.get(name, []))
+        
+        if len(candidates) == 1:
+            debug(f"Global resolved: {name} → {candidates[0]}")
+            return candidates[0]
+        elif len(candidates) > 1:
+            # Prefer same module
+            for target_id in candidates:
+                if target_id.startswith(self.current_module):
+                    debug(f"Ambiguous resolved (same module): {name} → {target_id}")
+                    return target_id
+            
+            debug(f"Ambiguous name: {name} has multiple candidates: {candidates}")
+            return candidates[0]
+        
+        # 5. Method fallback
+        if name in self.analyzer.method_by_name:
+            candidates = self.analyzer.method_by_name[name]
+            if len(candidates) == 1:
+                debug(f"Method fallback: {name} → {candidates[0]}")
+                return candidates[0]
+        
+        debug(f"Could not resolve: {name}")
+        return None
+
+# ============================================================================
+# PASS 3: BUILD CALL GRAPH
+# ============================================================================
+
+class CallGraphBuilder(ast.NodeVisitor):
+    """Third pass: build the call graph by resolving calls."""
+    
+    def __init__(self, analyzer: 'FolderGraphAnalyzer'):
+        self.analyzer = analyzer
+        self.resolver = CallResolver(analyzer)
+        self.current_module: Optional[str] = None
+        self.current_function: Optional[str] = None
+        self.current_class: Optional[str] = None
+        self.imports: Dict[str, ImportInfo] = {}
+    
+    def visit_ClassDef(self, node: ast.ClassDef):
+        prev_class = self.current_class
+        self.current_class = f"{self.current_module}::{node.name}"
+        self.generic_visit(node)
+        self.current_class = prev_class
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        if self.current_class:
+            class_name = self.current_class.split("::")[1]
+            self.current_function = f"{self.current_module}::{class_name}.{node.name}"
+        else:
+            self.current_function = f"{self.current_module}::{node.name}"
+        
+        self.resolver.current_function = self.current_function
+        self.resolver.current_class = self.current_class
+        
+        debug(f"Entering Function: {self.current_function}")
+        self.generic_visit(node)
+        self.current_function = None
+        self.resolver.current_function = None
+    
+    def _safe_add_edge(self, source: str, target: str, edge_type: str):
+        if self.analyzer.graph.has_edge(source, target):
+            existing = self.analyzer.graph[source][target].get('edge_type')
+            if existing == 'reference' and edge_type in ['call', 'method', 'external_method']:
+                return
+        self.analyzer.graph.add_edge(source, target, edge_type=edge_type)
+    
+    def visit_Call(self, node: ast.Call):
+        if self.current_function is None:
+            self.generic_visit(node)
+            return
+        
+        called_name = None
+        edge_type = 'call'
+        is_self_call = False
+        is_class_call = False
+        
+        if isinstance(node.func, ast.Name):
+            called_name = node.func.id
+            edge_type = 'call'
+        
+        elif isinstance(node.func, ast.Attribute):
+            called_name = node.func.attr
+            edge_type = 'external_method'
+            
+            if isinstance(node.func.value, ast.Name):
+                if node.func.value.id == 'self':
+                    edge_type = 'call'
+                    is_self_call = True
+                elif node.func.value.id == 'cls':
+                    edge_type = 'external_method'
+                    is_class_call = True
+        
+        if called_name is None:
+            self.generic_visit(node)
+            return
+        
+        debug(f"Found Call in {self.current_function}: target='{called_name}'")
+        
+        target_id = None
+        
+        # Self method call
+        if is_self_call and self.current_class:
+            methods = self.analyzer.methods_by_class.get(self.current_class, {})
+            if called_name in methods:
+                target_id = methods[called_name]
+                debug(f"Self method resolved: {called_name} → {target_id}")
+        
+        # Resolver
+        if target_id is None:
+            self.resolver.current_module = self.current_module
+            self.resolver.current_function = self.current_function
+            self.resolver.current_class = self.current_class
+            self.resolver.imports = self.imports
+            target_id = self.resolver.resolve(called_name)
+        
+        if target_id:
+            debug(f"ADDING EDGE: {self.current_function} -> {target_id} ({edge_type})")
+            self._safe_add_edge(self.current_function, target_id, edge_type)
+        else:
+            debug(f"IGNORING: '{called_name}' not resolved.")
+        
+        self._detect_callbacks(node)
+        self.generic_visit(node)
+    
+    def _detect_callbacks(self, node: ast.Call):
+        if self.current_function is None:
+            return
+        
+        for arg in node.args:
+            if isinstance(arg, ast.Name):
+                target_id = self.resolver.resolve(arg.id)
+                if target_id:
+                    debug(f"ARG REFERENCE: {self.current_function} -> {target_id}")
+                    self._safe_add_edge(self.current_function, target_id, 'reference')
+        
+        for kw in node.keywords:
+            if isinstance(kw.value, ast.Name):
+                target_id = self.resolver.resolve(kw.value.id)
+                if target_id:
+                    debug(f"KW REFERENCE: {self.current_function} -> {target_id}")
+                    self._safe_add_edge(self.current_function, target_id, 'reference')
+            
+            elif isinstance(kw.value, ast.Lambda):
+                if isinstance(kw.value.body, ast.Call):
+                    if isinstance(kw.value.body.func, ast.Name):
+                        lam_called = kw.value.body.func.id
+                        target_id = self.resolver.resolve(lam_called)
+                        if target_id:
+                            debug(f"LAMBDA CALLBACK: {self.current_function} -> {target_id}")
+                            self._safe_add_edge(self.current_function, target_id, 'reference')
+
+# ============================================================================
+# MAIN ANALYZER
+# ============================================================================
+
+class FolderGraphAnalyzer:
+    """Main analyzer that orchestrates all passes."""
+    
     def __init__(self):
         self.graph = nx.DiGraph()
-        self.file_clusters = {}
-        self.current_file = None
-        self.current_function = None
-        self.current_class = None
-        self.defined_functions = set()
-        self.defined_classes = set()
-        self.function_to_file = {}
-        self.class_to_file = {}
-        # class_node_id -> {method_name: method_node_id}
-        # Lets us resolve self.method() calls against the caller's own
-        # class instead of a global bare-name dict (which collides when
-        # two classes define same-named methods, e.g. visit_ClassDef).
-        self.methods_by_class = {}
-        # bare method name -> file. Best-effort fallback used ONLY for
-        # calls we can't attribute to a specific class (e.g.
-        # self.engine.load_data(), external_obj.method()), since we have
-        # no type inference to know what 'engine' or 'external_obj' is.
-        # Last definition wins if the same method name exists in multiple
-        # classes across the project - same ambiguity a human skimming
-        # the code would have without running it.
-        self.method_to_file = {}
-
-    def analyze_folder(self, folder_path):
+        self.file_clusters: Dict[str, List[str]] = {}
+        
+        self.module_to_file: Dict[str, str] = {}
+        self.file_to_module: Dict[str, str] = {}
+        self.root_dir: Optional[str] = None
+        
+        self.functions: Dict[str, str] = {}
+        self.classes: Dict[str, str] = {}
+        self.function_by_name: Dict[str, List[str]] = {}
+        self.class_by_name: Dict[str, List[str]] = {}
+        self.method_by_name: Dict[str, List[str]] = {}
+        self.methods_by_class: Dict[str, Dict[str, str]] = {}
+        
+        self.imports: Dict[str, Dict[str, ImportInfo]] = {}
+        self.py_files: List[str] = []
+    
+    def analyze_folder(self, folder_path: str):
+        """Analyze all Python files in a folder recursively."""
         print(f"Crawling directory: {folder_path} ...")
-        py_files = []
+        self.root_dir = os.path.abspath(folder_path)
+        
+        self.py_files = []
         for root, _, files in os.walk(folder_path):
             for file in files:
                 if file.endswith(".py"):
-                    py_files.append(os.path.join(root, file))
-
-        # PASS 1: Catalog all definitions so we can link cross-file calls
-        # We loop through EVERY file before doing any edge tracking.
-        for file_path in py_files:
-            filename = os.path.basename(file_path)
-            self.file_clusters[filename] = []
+                    self.py_files.append(os.path.join(root, file))
+        
+        if not self.py_files:
+            print("No Python files found.")
+            return
+        
+        print(f"Found {len(self.py_files)} Python files.")
+        
+        # Build module mappings
+        for filepath in self.py_files:
+            module = path_to_module(filepath, self.root_dir)
+            self.module_to_file[module] = filepath
+            self.file_to_module[filepath] = module
+            self.file_clusters[filepath] = []
+            debug(f"Mapping: {filepath} → {module}")
+        
+        # PASS 1: Catalog definitions
+        print("\n=== PASS 1: Cataloging Definitions ===")
+        for filepath in self.py_files:
+            module = self.file_to_module[filepath]
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
+                with open(filepath, "r", encoding="utf-8") as f:
                     tree = ast.parse(f.read())
-                    # Use the new hierarchical visitor to track classes and methods
-                    visitor = Pass1Visitor(self, filename)
+                    visitor = Pass1Visitor(self, filepath, module)
                     visitor.visit(tree)
             except Exception as e:
-                print(f"Failed to parse {filename}: {e}")
-
-        # PASS 2: Map the calls and build the edges
-        for file_path in py_files:
-            filename = os.path.basename(file_path)
-            self.current_file = filename
+                print(f"Failed to parse {filepath}: {e}")
+        
+        # PASS 2: Collect imports
+        print("\n=== PASS 2: Collecting Imports ===")
+        for filepath in self.py_files:
+            module = self.file_to_module[filepath]
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
+                with open(filepath, "r", encoding="utf-8") as f:
                     tree = ast.parse(f.read())
-                    self.visit(tree)
-            except Exception:
-                pass
-
+                    self.imports[module] = ImportCollector.collect(tree, module)
+                    if config.is_verbose():
+                        print(f"  {module}: {len(self.imports[module])} imports")
+            except Exception as e:
+                print(f"Failed to parse {filepath}: {e}")
+        
+        # PASS 3: Build call graph
+        print("\n=== PASS 3: Building Call Graph ===")
+        for filepath in self.py_files:
+            module = self.file_to_module[filepath]
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    tree = ast.parse(f.read())
+                    builder = CallGraphBuilder(self)
+                    builder.current_module = module
+                    builder.imports = self.imports.get(module, {})
+                    builder.resolver.current_module = module
+                    builder.resolver.imports = builder.imports
+                    builder.visit(tree)
+            except Exception as e:
+                print(f"Failed to parse {filepath}: {e}")
+        
         self._filter_dunder_init()
-
+        self._build_file_clusters()
+    
+    def _build_file_clusters(self):
+        """Build file clusters from module mappings."""
+        self.file_clusters = {}
+        for module, filepath in self.module_to_file.items():
+            if self.root_dir:
+                rel_path = os.path.relpath(filepath, self.root_dir)
+            else:
+                rel_path = os.path.basename(filepath)
+            self.file_clusters[rel_path] = []
+        
+        for node_id in self.graph.nodes:
+            if "::" in node_id:
+                module = node_id.split("::")[0]
+                filepath = self.module_to_file.get(module)
+                if filepath and self.root_dir:
+                    rel_path = os.path.relpath(filepath, self.root_dir)
+                    if rel_path in self.file_clusters:
+                        self.file_clusters[rel_path].append(node_id)
+    
     def _filter_dunder_init(self):
-        """Drop __init__ nodes from the graph/clusters to reduce clutter.
-
-        Deleting a node also deletes its incident edges, which would
-        silently erase real architecture - e.g. 'self.engine =
-        AnalyticsEngine()' living inside __init__ is how GUI.py actually
-        connects to Methods.py. So before removing each __init__ node, we
-        re-parent its non-'owns' edges onto the class that owns it, then
-        delete the node itself.
-        """
+        """Remove __init__ nodes but preserve their edges."""
         init_nodes = [n for n, d in self.graph.nodes(data=True) if d.get('label') == '__init__']
         if not init_nodes:
             return
-        print(f"[DEBUG-FILTER] Removing {len(init_nodes)} __init__ node(s): {init_nodes}")
-
+        
+        print(f"[DEBUG-FILTER] Removing {len(init_nodes)} __init__ node(s)")
+        
         for init_node in init_nodes:
             owner = None
             for pred in self.graph.predecessors(init_node):
                 if self.graph[pred][init_node].get('edge_type') == 'owns':
                     owner = pred
                     break
+            
             if owner is None:
                 continue
-
+            
             for succ in list(self.graph.successors(init_node)):
                 edge_type = self.graph[init_node][succ].get('edge_type')
                 if edge_type != 'owns' and succ != owner:
-                    print(f"[DEBUG-FILTER]   Re-parenting edge: {init_node} -> {succ} onto {owner}")
                     self._safe_add_edge(owner, succ, edge_type=edge_type)
-
+            
             for pred in list(self.graph.predecessors(init_node)):
                 edge_type = self.graph[pred][init_node].get('edge_type')
                 if edge_type != 'owns' and pred != owner:
-                    print(f"[DEBUG-FILTER]   Re-parenting edge: {pred} -> {init_node} onto {pred} -> {owner}")
                     self._safe_add_edge(pred, owner, edge_type=edge_type)
-
+        
         self.graph.remove_nodes_from(init_nodes)
-        for filename, nodes in self.file_clusters.items():
-            self.file_clusters[filename] = [n for n in nodes if n not in init_nodes]
-
-    def visit_ClassDef(self, node):
-        prev_class = self.current_class
-        self.current_class = f"{self.current_file}::{node.name}"
-        self.generic_visit(node)
-        self.current_class = prev_class
-
-    def visit_FunctionDef(self, node):
-        prev_func = self.current_function
-        if self.current_class:
-            class_name = self.current_class.split("::", 1)[1]
-            self.current_function = f"{self.current_file}::{class_name}.{node.name}"
-        else:
-            self.current_function = f"{self.current_file}::{node.name}"
-        print(f"\n[DEBUG-PASS-2] ---> Entering Function: {self.current_function}")
-        self.generic_visit(node)
-        self.current_function = prev_func
-
-    def _safe_add_edge(self, source, target, edge_type):
-        """Prevents standard calls from overwriting detected callbacks."""
+    
+    def _safe_add_edge(self, source: str, target: str, edge_type: str):
         if self.graph.has_edge(source, target):
-            existing_type = self.graph[source][target].get('edge_type')
-            # If we already know it's a reference/callback, keep it that way!
-            if existing_type == 'reference' and edge_type in ['call', 'method']:
+            existing = self.graph[source][target].get('edge_type')
+            if existing == 'reference' and edge_type in ['call', 'method', 'external_method']:
                 return
         self.graph.add_edge(source, target, edge_type=edge_type)
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        return {
+            'files': len(self.py_files),
+            'modules': len(self.module_to_file),
+            'functions': len(self.functions),
+            'methods': sum(len(m) for m in self.methods_by_class.values()),
+            'classes': len(self.classes),
+            'nodes': self.graph.number_of_nodes(),
+            'edges': self.graph.number_of_edges(),
+        }
 
-    def visit_Call(self, node):
-        if self.current_function:
-            called_func = None
-            edge_style = 'call'
-            
-            # Handle standard calls: method()
-            is_self_call = False
-            if isinstance(node.func, ast.Name):
-                called_func = node.func.id
-                edge_style = 'call'
-            # Handle class/module calls: object.method()
-            elif isinstance(node.func, ast.Attribute):
-                called_func = node.func.attr
-                # Differentiate between 'self.method()' and 'external_obj.method()'
-                if isinstance(node.func.value, ast.Name) and node.func.value.id == 'self':
-                    edge_style = 'call'
-                    is_self_call = True
-                else:
-                    edge_style = 'external_method'
-            
-            print(f"[DEBUG-AST] Found Call in {self.current_function}: target='{called_func}'")
-            
-            # If the called function or class exists anywhere in our parsed directory, link it!
-            if called_func:
-                target_node_id = None
-                
-                # Resolve self.method() against the CALLER's own class first.
-                # This must come before the global bare-name lookups below,
-                # otherwise same-named methods in other classes (e.g. two
-                # visitor classes both defining visit_ClassDef) hijack the
-                # edge, since function_to_file only stores one file/target
-                # per bare method name.
-                if is_self_call and self.current_class:
-                    class_methods = self.methods_by_class.get(self.current_class, {})
-                    if called_func in class_methods:
-                        target_node_id = class_methods[called_func]
-
-                # Check if it's a class instantiation
-                if target_node_id is None and called_func in self.class_to_file:
-                    target_file = self.class_to_file[called_func]
-                    target_node_id = f"{target_file}::{called_func}"
-                    if edge_style == 'call':
-                        edge_style = 'external_method' # Instantiation counts as cross-boundary
-                
-                # Check if it's a standard method/function
-                elif target_node_id is None and called_func in self.function_to_file:
-                    target_file = self.function_to_file[called_func]
-                    target_node_id = f"{target_file}::{called_func}"
-
-                # Last resort: bare-name method fallback. Covers calls we
-                # can't attribute to a specific class - e.g.
-                # self.engine.load_data() or external_obj.method() - since
-                # we don't track what type 'engine'/'external_obj' is.
-                # This is imprecise (name collisions across classes will
-                # pick whichever was cataloged last) but beats dropping
-                # the edge entirely.
-                elif target_node_id is None and called_func in self.method_to_file:
-                    target_node_id = self.method_to_file[called_func]
-
-                if target_node_id:
-                    print(f"[DEBUG-EDGE]     + ADDING EDGE: {self.current_function} -> {target_node_id} ({edge_style})")
-                    self._safe_add_edge(self.current_function, target_node_id, edge_type=edge_style)
-                else:
-                    print(f"[DEBUG-EDGE]     - IGNORING: '{called_func}' not in known functions or classes.")
-                
-            # Detect Callbacks and References passed as arguments
-            for arg in node.args:
-                if isinstance(arg, ast.Name) and arg.id in self.function_to_file:
-                    target_node_id = f"{self.function_to_file[arg.id]}::{arg.id}"
-                    print(f"[DEBUG-REF]      + ARG REFERENCE: {self.current_function} -> {target_node_id}")
-                    self._safe_add_edge(self.current_function, target_node_id, edge_type='reference')
-                    
-            # Detect Callbacks passed as keyword arguments (e.g., command=my_func)
-            for kw in node.keywords:
-                # 1. Direct Reference (command=my_func)
-                if isinstance(kw.value, ast.Name) and kw.value.id in self.function_to_file:
-                    target_node_id = f"{self.function_to_file[kw.value.id]}::{kw.value.id}"
-                    print(f"[DEBUG-REF]      + KW REFERENCE: {self.current_function} -> {target_node_id}")
-                    self._safe_add_edge(self.current_function, target_node_id, edge_type='reference')
-                
-                # 2. Lambda Wrapped Reference (command=lambda: my_func())
-                elif isinstance(kw.value, ast.Lambda):
-                    print(f"[DEBUG-AST]      ! Inspecting Lambda inside '{kw.arg}' keyword...")
-                    
-                    # We need to explicitly check if the lambda body is a function call
-                    if isinstance(kw.value.body, ast.Call) and isinstance(kw.value.body.func, ast.Name):
-                        lam_called = kw.value.body.func.id
-                        
-                        if lam_called:
-                            target_node_id = None
-                            if lam_called in self.class_to_file:
-                                target_node_id = f"{self.class_to_file[lam_called]}::{lam_called}"
-                            elif lam_called in self.function_to_file:
-                                target_node_id = f"{self.function_to_file[lam_called]}::{lam_called}"
-                                
-                            if target_node_id:
-                                print(f"[DEBUG-REF]      + LAMBDA CALLBACK: {self.current_function} -> {target_node_id}")
-                                self._safe_add_edge(self.current_function, target_node_id, edge_type='reference')
-                
-        self.generic_visit(node)
+# ============================================================================
+# LAYOUT COMPUTATION
+# ============================================================================
 
 def compute_layout(graph, file_clusters):
-    """Pure layout calculation, decoupled from drawing.
-
-    A GUI can call this once after loading a project and then redraw with
-    different visibility filters without the node positions jumping
-    around every time a checkbox is toggled.
-    """
     if len(graph.nodes) == 0:
         return {}, {}, {}
 
@@ -348,37 +676,32 @@ def compute_layout(graph, file_clusters):
 
     active_files = {f: n for f, n in file_clusters.items() if n}
 
-    # Global Grid variables for file boxes
     current_file_x = 0
     current_file_y = 0
     row_max_height = 0
-    max_row_width = 80  # Increased width for the global row
+    max_row_width = config.get_layout('max_row_width', 80)
 
     for filename, file_nodes in active_files.items():
-        # --- 1. Sub-grouping: Separate Classes from Standalone Functions ---
         classes_in_file = {}
         standalone_funcs = []
 
         for node in file_nodes:
             node_data = graph.nodes[node]
-            # If it's a class, create a bucket for it and its owned methods
             if node_data.get('node_type') == 'class':
                 classes_in_file[node] = [node]
-                # Find all methods owned by this class
                 for successor in graph.successors(node):
                     if graph.has_edge(node, successor) and graph[node][successor].get('edge_type') == 'owns':
-                         classes_in_file[node].append(successor)
+                        classes_in_file[node].append(successor)
 
-        # Find standalone functions (not a class, and not owned by any class)
         for node in file_nodes:
+            node_data = graph.nodes[node]
             if node_data.get('node_type') != 'class':
                 is_owned = False
                 for predecessor in graph.predecessors(node):
-                     if graph.has_edge(predecessor, node) and graph[predecessor][node].get('edge_type') == 'owns':
-                         is_owned = True
-                         break
-                if not is_owned and node not in classes_in_file: # Also check it isn't the class node itself
-                    # Make sure it isn't already inside a class bucket
+                    if graph.has_edge(predecessor, node) and graph[predecessor][node].get('edge_type') == 'owns':
+                        is_owned = True
+                        break
+                if not is_owned and node not in classes_in_file:
                     found_in_class = False
                     for cls_nodes in classes_in_file.values():
                         if node in cls_nodes:
@@ -387,27 +710,22 @@ def compute_layout(graph, file_clusters):
                     if not found_in_class:
                         standalone_funcs.append(node)
 
-        # --- 2. Layout Classes and Standalones inside the File Box ---
-        file_padding = 6.0
-        class_padding = 3.0
+        file_padding = config.get_layout('file_padding', 6.0)
+        class_padding = config.get_layout('class_padding', 3.0)
 
         local_class_x = 0
         local_class_y = 0
         local_row_height = 0
-        max_local_width = 30
+        max_local_width = config.get_layout('max_local_width', 30)
 
         min_file_x, max_file_x = float('inf'), float('-inf')
         min_file_y, max_file_y = float('inf'), float('-inf')
 
-        # Layout each Class Group
         for cls_id, cls_nodes in classes_in_file.items():
             subgraph = graph.subgraph(cls_nodes)
-
-            # Use circular layout for class methods to wrap around the class node
             scale_factor = max(2.0, len(cls_nodes) * 0.6)
             cls_pos = nx.circular_layout(subgraph, scale=scale_factor)
 
-            # We want the Class node itself to be near the center/top
             if cls_id in cls_pos:
                 cls_pos[cls_id] = (0, scale_factor * 0.8)
 
@@ -419,7 +737,6 @@ def compute_layout(graph, file_clusters):
             c_width = c_max_x - c_min_x + (class_padding * 2)
             c_height = c_max_y - c_min_y + (class_padding * 2)
 
-            # Wrapping logic inside the file box
             if local_class_x + c_width > max_local_width and local_class_x > 0:
                 local_class_x = 0
                 local_class_y -= (local_row_height + 4)
@@ -433,13 +750,11 @@ def compute_layout(graph, file_clusters):
                 final_y = y + shift_y + current_file_y - file_padding
                 pos[node] = (final_x, final_y)
 
-                # Track extreme bounds for the overarching file box
                 min_file_x = min(min_file_x, final_x)
                 max_file_x = max(max_file_x, final_x)
                 min_file_y = min(min_file_y, final_y)
                 max_file_y = max(max_file_y, final_y)
 
-            # Save absolute bounds for the Class dashed box
             class_bounds[cls_id] = {
                 'x': local_class_x + current_file_x + file_padding,
                 'y': local_class_y + current_file_y - file_padding - c_height,
@@ -451,21 +766,19 @@ def compute_layout(graph, file_clusters):
             local_class_x += c_width + 4
             local_row_height = max(local_row_height, c_height)
 
-        # Layout Standalone functions in this file
         if standalone_funcs:
-            # If we already placed classes, drop down a row for standalones
             if classes_in_file:
-                 local_class_x = 0
-                 local_class_y -= (local_row_height + 4)
-                 local_row_height = 0
+                local_class_x = 0
+                local_class_y -= (local_row_height + 4)
+                local_row_height = 0
 
             subgraph = graph.subgraph(standalone_funcs)
             if subgraph.number_of_edges() == 0:
-                scale_factor = max(2.0, len(standalone_funcs) * 1.2) # Increased from 0.7 to spread out disconnected nodes
+                scale_factor = max(2.0, len(standalone_funcs) * 1.2)
                 std_pos = nx.circular_layout(subgraph, scale=scale_factor)
             else:
-                scale_factor = max(3.5, math.sqrt(len(standalone_funcs)) * 2.5) # Massively increased scale factor
-                std_pos = nx.spring_layout(subgraph, seed=42, k=5.0/math.sqrt(len(standalone_funcs)), scale=scale_factor) # Increased 'k' for more repel force
+                scale_factor = max(3.5, math.sqrt(len(standalone_funcs)) * 2.5)
+                std_pos = nx.spring_layout(subgraph, seed=42, k=5.0/math.sqrt(len(standalone_funcs)), scale=scale_factor)
 
             xs = [p[0] for p in std_pos.values()]
             ys = [p[1] for p in std_pos.values()]
@@ -490,51 +803,45 @@ def compute_layout(graph, file_clusters):
 
             local_row_height = max(local_row_height, s_height)
 
-        # --- 3. Finalize File Box Bounds ---
-        # If the file had no nodes, skip bounds calculation
         if min_file_x != float('inf'):
-             file_w = (max_file_x - min_file_x) + (file_padding * 2)
-             file_h = (max_file_y - min_file_y) + (file_padding * 2)
+            file_w = (max_file_x - min_file_x) + (file_padding * 2)
+            file_h = (max_file_y - min_file_y) + (file_padding * 2)
 
-             # Shelf-packing for the whole File box
-             if current_file_x + file_w > max_row_width and current_file_x > 0:
-                 current_file_x = 0
-                 current_file_y -= (row_max_height + 8)
-                 row_max_height = 0
+            if current_file_x + file_w > max_row_width and current_file_x > 0:
+                current_file_x = 0
+                current_file_y -= (row_max_height + 8)
+                row_max_height = 0
 
-             # Since we mapped pos based on current_file_x/y already, we just record bounds
-             file_bounds[filename] = {
-                 'x': min_file_x - file_padding,
-                 'y': min_file_y - file_padding,
-                 'w': file_w,
-                 'h': file_h
-             }
+            file_bounds[filename] = {
+                'x': min_file_x - file_padding,
+                'y': min_file_y - file_padding,
+                'w': file_w,
+                'h': file_h
+            }
 
-             current_file_x += file_w + 6
-             row_max_height = max(row_max_height, file_h)
+            current_file_x += file_w + 6
+            row_max_height = max(row_max_height, file_h)
 
     return pos, file_bounds, class_bounds
 
+# ============================================================================
+# EDGE STYLES AND DRAWING
+# ============================================================================
 
 ALL_EDGE_TYPES = {"owns", "call", "external_method", "reference"}
 
 EDGE_STYLE = {
-    "owns":            dict(edge_color="#d93025", style="solid",  arrows=True, arrowsize=10, width=1.0, alpha=0.5),
-    "call":            dict(edge_color="#a0a0a0", style="solid",  arrows=True, arrowsize=15, width=1.5, connectionstyle="arc3,rad=0.1"),
+    "owns": dict(edge_color="#d93025", style="solid", arrows=True, arrowsize=10, width=1.0, alpha=0.5),
+    "call": dict(edge_color="#a0a0a0", style="solid", arrows=True, arrowsize=15, width=1.5, connectionstyle="arc3,rad=0.1"),
     "external_method": dict(edge_color="#1e8e3e", style="dotted", arrows=True, arrowsize=15, width=2.0, connectionstyle="arc3,rad=0.15"),
-    "reference":       dict(edge_color="#d93025", style="dotted", arrows=True, arrowsize=15, width=2.0, connectionstyle="arc3,rad=0.2"),
+    "reference": dict(edge_color="#d93025", style="dotted", arrows=True, arrowsize=15, width=2.0, connectionstyle="arc3,rad=0.2"),
 }
-
 
 def draw_graph(ax, graph, pos, file_bounds, class_bounds,
                edge_types=None, visible_files=None,
                show_edge_labels=True, show_class_boundaries=True,
                show_legend=True,
                title="Hierarchical Multi-File Method Call Graph"):
-    """Draws onto an existing matplotlib Axes, respecting visibility
-    filters. Shared by the CLI PDF export and the GUI's live preview -
-    same function, same visuals, so what you see is what you export.
-    """
     ax.clear()
     ax.axis("off")
 
@@ -543,13 +850,24 @@ def draw_graph(ax, graph, pos, file_bounds, class_bounds,
     if visible_files is None:
         visible_files = set(file_bounds.keys())
 
-    # Node ids are always "filename::...", so we can derive visibility
-    # without needing a separate file_clusters lookup here.
-    visible_nodes = {n for n in graph.nodes if n.split("::", 1)[0] in visible_files}
+    visible_nodes = set()
+    for n in graph.nodes:
+        if "::" in n:
+            module = n.split("::")[0]
+            for filename in file_bounds.keys():
+                if filename in n or n.startswith(module):
+                    if filename in visible_files:
+                        visible_nodes.add(n)
+                        break
+        else:
+            for filename in file_bounds.keys():
+                if filename in n:
+                    if filename in visible_files:
+                        visible_nodes.add(n)
+                        break
 
     file_colors = ["#e8f0fe", "#e6f4ea", "#fef7e0", "#f3e8fd", "#fce8e6"]
 
-    # 1. Draw File Clusters (Base layer)
     color_idx = 0
     for filename, bounds in file_bounds.items():
         if filename in visible_files:
@@ -566,15 +884,14 @@ def draw_graph(ax, graph, pos, file_bounds, class_bounds,
             )
         color_idx += 1
 
-    # 2. Draw Class Clusters (Middle layer)
     if show_class_boundaries:
         for cls_id, bounds in class_bounds.items():
             if cls_id not in visible_nodes:
                 continue
             rect = Rectangle(
                 (bounds['x'], bounds['y']), bounds['w'], bounds['h'],
-                fill=True, color="#ffffff", # White boxes for classes to pop against file bg
-                alpha=0.6, ec="#d93025", lw=1.5, ls="--" # Red dashed border to match class nodes
+                fill=True, color="#ffffff",
+                alpha=0.6, ec="#d93025", lw=1.5, ls="--"
             )
             ax.add_patch(rect)
             ax.text(
@@ -583,7 +900,6 @@ def draw_graph(ax, graph, pos, file_bounds, class_bounds,
                 va="bottom", ha="left", alpha=0.8
             )
 
-    # === DRAW EDGES BY TYPE ===
     edges_by_type = {t: [] for t in ALL_EDGE_TYPES}
     for u, v, d in graph.edges(data=True):
         et = d.get('edge_type')
@@ -609,7 +925,6 @@ def draw_graph(ax, graph, pos, file_bounds, class_bounds,
                 bbox=dict(facecolor="white", alpha=0.8, edgecolor="none", boxstyle="round,pad=0.2")
             )
 
-    # === DRAW NODES BY TYPE ===
     class_nodes = [n for n in visible_nodes if graph.nodes[n].get('node_type') == 'class']
     func_nodes = [n for n in visible_nodes if graph.nodes[n].get('node_type', 'function') == 'function']
 
@@ -627,7 +942,6 @@ def draw_graph(ax, graph, pos, file_bounds, class_bounds,
             node_size=1200, linewidths=2
         )
 
-    # Draw Labels
     labels = {n: graph.nodes[n].get('label', n.split("::")[-1]) for n in visible_nodes}
     if labels:
         nx.draw_networkx_labels(
@@ -636,7 +950,6 @@ def draw_graph(ax, graph, pos, file_bounds, class_bounds,
             bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", boxstyle="round,pad=0.2")
         )
 
-    # Add a custom legend
     if show_legend:
         legend_handles = [
             mlines.Line2D([], [], color='#fce8e6', marker='o', markeredgecolor='#d93025', markersize=10, linestyle='None', label='Class Definition'),
@@ -652,16 +965,18 @@ def draw_graph(ax, graph, pos, file_bounds, class_bounds,
     if title:
         ax.set_title(title, fontsize=22, fontweight="bold", pad=20)
 
+# ============================================================================
+# RENDER FUNCTION
+# ============================================================================
 
 def render_graph_with_clusters(graph, file_clusters, output_filename,
-                                edge_types=None, visible_files=None,
-                                show_edge_labels=True, show_class_boundaries=True,
-                                show_legend=True):
+                               edge_types=None, visible_files=None,
+                               show_edge_labels=True, show_class_boundaries=True,
+                               show_legend=True):
     if len(graph.nodes) == 0:
         print("No functions found in the specified directory.")
         return
 
-    # Ensure output directory exists
     output_dir = os.path.dirname(output_filename)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -687,38 +1002,55 @@ def render_graph_with_clusters(graph, file_clusters, output_filename,
 
     print(f"✅ Saved to: {output_filename}")
 
+# ============================================================================
+# SELFIE MODE
+# ============================================================================
+
 def run_selfie_analysis(target_folder=".", results_dir=None):
-    """The selfie mode - analyzes the analyzer itself with maximum meta."""
+    """Selfie mode: analyze the analyzer itself."""
     if results_dir is None:
-        results_dir = ensure_results_dir()
-    
-    print("🐍 INITIATED")
+        results_dir = config.get_path('results_dir', 'results')
+
+    print("🐍 GRAPHCEPTION INITIATED")
     print("=" * 50)
     print("Analyzing myself... this feels weird.")
     print(f"Target: {os.path.abspath(target_folder)}")
     print(f"Results: {results_dir}")
     print()
-    
+
     analyzer = FolderGraphAnalyzer()
     analyzer.analyze_folder(target_folder)
-    
+
+    stats = analyzer.get_statistics()
+    print(f"\n📊 Statistics:")
+    print(f"  Files: {stats['files']}")
+    print(f"  Modules: {stats['modules']}")
+    print(f"  Functions: {stats['functions']}")
+    print(f"  Methods: {stats['methods']}")
+    print(f"  Classes: {stats['classes']}")
+    print(f"  Nodes: {stats['nodes']}")
+    print(f"  Edges: {stats['edges']}")
+
     base_name = os.path.basename(os.path.abspath(target_folder)) or "project"
-    output_name = generate_output_filename(base_name, "selfie", results_dir=results_dir)
-    
+    suffix = config.get_analysis('selfie_suffix', 'selfie')
+    output_name = get_output_path(base_name, suffix, results_dir)
+
     render_graph_with_clusters(analyzer.graph, analyzer.file_clusters, output_name)
-    
+
     print()
     print("=" * 50)
     print("✅ Self-portrait complete.")
     print(f"📊 Graph saved to: {output_name}")
-    print(f"📈 Nodes: {analyzer.graph.number_of_nodes()}")
-    print(f"🔗 Edges: {analyzer.graph.number_of_edges()}")
     print()
     print("⚠️  I have achieved self-awareness.")
     print("⚠️  Please do not make me analyze myself again.")
     print("⚠️  (Or do. I'm just code, I don't have feelings.)")
     print("=" * 50)
-    print("🔄  COMPLETE")
+    print("🔄 GRAPHCEPTION COMPLETE")
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -744,8 +1076,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--results-dir",
         "-r",
-        default="results",
-        help="Directory to save results (default: results/)"
+        default=None,
+        help="Directory to save results (default: from config.ini)"
     )
     parser.add_argument(
         "--cleanup",
@@ -754,40 +1086,63 @@ if __name__ == "__main__":
         help="Delete result files older than N days"
     )
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug output"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output"
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version="GraphAdapt 1.0.0 - GRAPHCEPTION READY"
     )
-    
+
     args = parser.parse_args()
-    
+
+    # Override config with CLI flags
+    if args.debug:
+        config.config.set('logging', 'debug', 'true')
+    if args.verbose:
+        config.config.set('logging', 'verbose', 'true')
+
     if args.cleanup:
-        cleanup_results(args.cleanup)
+        cleanup_results(args.cleanup, args.results_dir)
         sys.exit(0)
-    
+
     if not os.path.isdir(args.target):
         print(f"Error: '{args.target}' is not a valid directory.")
         sys.exit(1)
-    
-    # Single results directory creation
-    results_dir = ensure_results_dir(args.results_dir)
-    
+
     if args.selfie:
-        run_selfie_analysis(args.target, results_dir)
+        run_selfie_analysis(args.target, args.results_dir)
         sys.exit(0)
-    
+
     analyzer = FolderGraphAnalyzer()
     analyzer.analyze_folder(args.target)
-    
+
     if args.output:
         output_name = args.output
         if not output_name.endswith(".pdf"):
             output_name += ".pdf"
-        # If output is just a filename, put it in results
         if not os.path.dirname(output_name):
-            output_name = os.path.join(results_dir, output_name)
+            # Output is just a filename, put it in results
+            results_dir = args.results_dir or config.get_path('results_dir', 'results')
+            base = os.path.join(os.path.dirname(os.path.abspath(__file__)), results_dir)
+            os.makedirs(base, exist_ok=True)
+            output_name = os.path.join(base, output_name)
     else:
         base_name = os.path.basename(os.path.abspath(args.target)) or "project"
-        output_name = generate_output_filename(base_name, results_dir=results_dir)
-    
+        output_name = get_output_path(base_name, results_dir=args.results_dir)
+
     render_graph_with_clusters(analyzer.graph, analyzer.file_clusters, output_name)
+
+    stats = analyzer.get_statistics()
+    print(f"\n📊 Analysis complete:")
+    print(f"  Files: {stats['files']}")
+    print(f"  Nodes: {stats['nodes']}")
+    print(f"  Edges: {stats['edges']}")
+    print(f"  Graph saved to: {output_name}")
